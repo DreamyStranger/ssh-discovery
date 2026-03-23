@@ -11,21 +11,28 @@ Python library for discovering remote filesystem entries over SSH/SFTP.
 ## Overview
 
 `ssh-discovery` connects to a remote host over SSH/SFTP, scans a path for
-matching entries, and returns their metadata as Python objects. It can also do
-deterministic incremental discovery when the caller provides an anchor tuple.
+matching entries, and returns their metadata as typed Python objects. It
+supports three discovery modes and optional incremental discovery via an
+anchor checkpoint.
 
-This package supports:
-- immediate directories in a path
-- immediate files in a path
-- recursive file discovery under a path
-- optional incremental discovery using `(anchor_mtime, anchor_path)`
+## Discovery modes
+
+| Mode | What it returns |
+|---|---|
+| `"directories"` | Immediate subdirectories of `remote_path` matching `file_glob` |
+| `"files"` | Immediate files in `remote_path` matching `file_glob` |
+| `"files_recursive"` | All files under `remote_path` (depth-first), matching `file_glob` |
+
+All results are sorted by `(mtime, path)` for deterministic downstream
+processing. Pass an anchor to receive only entries newer than a known
+checkpoint — useful for polling workflows that track the last-processed entry.
 
 ## Architecture
 
 ```text
 ssh_discovery/
 |- __init__.py       Public API re-exports
-|- service.py        DiscoveryService - main entry point
+|- service.py        DiscoveryService — main entry point
 |- config.py         Typed config dataclasses
 |- models.py         Shared domain models
 |- transport/        SSH/SFTP connectivity and remote entry listing
@@ -34,11 +41,11 @@ ssh_discovery/
 
 ### Data flow per `DiscoveryService.run()` call
 
-1. Open SSH.
-2. Open SFTP.
-3. List matching remote entries.
+1. Open SSH connection.
+2. Open SFTP session.
+3. List remote entries matching `mode` and `file_glob`.
 4. Sort results by `(mtime, path)`.
-5. Optionally drop entries whose `(mtime, path)` is not newer than the anchor tuple.
+5. Drop entries not newer than the anchor tuple (if configured).
 6. Return `list[RemoteEntry]`.
 
 ## Installation
@@ -50,7 +57,7 @@ pip install ssh-discovery
 Or from source:
 
 ```bash
-git clone <repo>
+git clone https://github.com/DreamyStranger/ssh-discovery.git
 cd ssh-discovery
 pip install -e ".[dev]"
 ```
@@ -59,36 +66,45 @@ Requirements: Python 3.11+ and Paramiko.
 
 ## Usage
 
+### Basic
+
 ```python
 from ssh_discovery import DiscoveryConfig, DiscoveryService, SshConfig
 
 config = DiscoveryConfig(
     ssh=SshConfig(
         host="192.168.1.100",
-        port=22,
         username="logsync",
         private_key_path="/path/to/id_ed25519",
-        connect_timeout_seconds=10.0,
-        keepalive_seconds=30,
     ),
     remote_path="/var/log/mylogs",
     file_glob="*.log",
     mode="files_recursive",
-    anchor_mtime=None,  # or a timezone-aware datetime anchor
-    anchor_path=None,   # required together with anchor_mtime
 )
 
-service = DiscoveryService(config)
-remote_entries = service.run()
+entries = DiscoveryService(config).run()
 
-for entry in remote_entries:
-    print(entry.path, entry.mtime, entry.mode, entry.is_file, entry.is_dir)
+for entry in entries:
+    print(entry.path, entry.mtime, entry.size)
+```
+
+### Choosing a mode
+
+```python
+# Immediate subdirectories only
+config = DiscoveryConfig(ssh=ssh, remote_path="/data", mode="directories")
+
+# Immediate files only
+config = DiscoveryConfig(ssh=ssh, remote_path="/data/logs", mode="files", file_glob="*.log")
+
+# All files under the path, any depth
+config = DiscoveryConfig(ssh=ssh, remote_path="/data", mode="files_recursive", file_glob="*.gz")
 ```
 
 ### Incremental discovery
 
-If your orchestrator tracks the last processed entry, pass its `(mtime, path)`
-back into the next run:
+Pass the `(mtime, path)` of the last-processed entry to receive only newer
+results on the next run:
 
 ```python
 from datetime import datetime, timezone
@@ -105,23 +121,31 @@ config = DiscoveryConfig(
 )
 ```
 
+`anchor_mtime` and `anchor_path` must always be provided together.
+`anchor_mtime` must be timezone-aware.
+
 ### Error handling
 
 ```python
-from ssh_discovery import SshDiscoveryError, TransportError
+from ssh_discovery import DiscoveryError, SshDiscoveryError, TransportError
 
 try:
-    remote_entries = service.run()
+    entries = DiscoveryService(config).run()
 except TransportError as exc:
+    # SSH connection failed, auth rejected, SFTP session error, or listing failure
     logger.error("Transport failure: %s", exc)
-except SshDiscoveryError as exc:
+except DiscoveryError as exc:
+    # Unrecoverable error in the discovery workflow
     logger.error("Discovery failure: %s", exc)
+except SshDiscoveryError as exc:
+    # Catch-all for any ssh-discovery exception
+    logger.error("Unexpected failure: %s", exc)
 ```
 
 ### Logging
 
-This package uses standard Python module loggers and does not configure handlers
-or formatters. Configure logging in your application before calling
+This package uses standard Python module loggers and does not configure
+handlers or formatters. Configure logging in your application before calling
 `service.run()`.
 
 ```python
@@ -139,32 +163,45 @@ logging.basicConfig(
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `host` | `str` | - | IP or hostname of the remote host |
-| `port` | `int` | `22` | SSH port |
+| `host` | `str` | — | IP or hostname of the remote host |
+| `port` | `int` | `22` | SSH port (1–65535) |
 | `username` | `str` | `"logsync"` | SSH username |
 | `private_key_path` | `str \| None` | `None` | Path to private key file |
-| `password` | `str \| None` | `None` | Password auth or private-key passphrase |
+| `password` | `str \| None` | `None` | Password auth, or passphrase for an encrypted key |
 | `connect_timeout_seconds` | `float` | `30.0` | TCP, banner, and auth timeout |
-| `keepalive_seconds` | `int` | `60` | SSH keepalive interval, `0` disables |
-| `known_hosts_path` | `str \| None` | `None` | Known-hosts path for strict verification |
-| `allow_unknown_hosts` | `bool` | `False` | Accept unknown host keys automatically |
+| `keepalive_seconds` | `int` | `60` | SSH keepalive interval; `0` disables |
+| `known_hosts_path` | `str \| None` | `None` | Path to a custom known_hosts file |
+| `allow_unknown_hosts` | `bool` | `False` | Auto-accept unknown host keys (not for production) |
 
 At least one of `private_key_path` or `password` is required.
-Unknown SSH hosts are rejected by default. Set `allow_unknown_hosts=True`
-only in controlled environments where trust-on-first-use is acceptable.
+Unknown SSH host keys are rejected by default. Provide `known_hosts_path` for
+strict verification against a pre-populated file, or set `allow_unknown_hosts=True`
+only in controlled environments.
 
 ### `DiscoveryConfig`
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `ssh` | `SshConfig` | - | SSH connection settings |
-| `remote_path` | `str` | - | Remote path to scan |
-| `file_glob` | `str` | `"*"` | Glob pattern for matching entry names |
-| `mode` | `"directories" \| "files" \| "files_recursive"` | `"directories"` | Discovery behavior |
-| `anchor_mtime` | `datetime \| None` | `None` | Anchor timestamp for incremental discovery |
-| `anchor_path` | `str \| None` | `None` | Anchor path tiebreaker for incremental discovery |
+| `ssh` | `SshConfig` | — | SSH connection settings |
+| `remote_path` | `str` | — | Base path on the remote host to scan |
+| `file_glob` | `str` | `"*"` | fnmatch glob pattern applied to entry names |
+| `mode` | `"directories" \| "files" \| "files_recursive"` | `"directories"` | See [Discovery modes](#discovery-modes) |
+| `anchor_mtime` | `datetime \| None` | `None` | Timezone-aware anchor timestamp for incremental discovery |
+| `anchor_path` | `str \| None` | `None` | Anchor path tiebreaker; required when `anchor_mtime` is set |
 
-`anchor_mtime` and `anchor_path` must be provided together.
+### `RemoteEntry`
+
+Each discovered entry is returned as a `RemoteEntry` frozen dataclass.
+
+| Field / Property | Type | Description |
+|---|---|---|
+| `name` | `str` | Filename or directory name |
+| `path` | `str` | Full remote path |
+| `mtime` | `datetime` | Modification time (timezone-aware UTC) |
+| `mode` | `int \| None` | Unix stat mode bits; `None` if unavailable |
+| `is_file` | `bool` | True if entry is a regular file |
+| `is_dir` | `bool` | True if entry is a directory |
+| `is_symlink` | `bool` | True if entry is a symlink |
 
 ## Running tests
 
@@ -175,10 +212,8 @@ pytest --cov=ssh_discovery --cov-report=term-missing
 
 ## Notes
 
-- Results are sorted by remote `mtime`, with `path` as a tiebreaker.
-- When `anchor_mtime` and `anchor_path` are set, only entries with `(mtime, path)` greater than that tuple are returned.
-- Returned `RemoteEntry` objects include `name`, `path`, `mtime`, and raw `mode`.
-- Convenience properties `is_dir`, `is_file`, and `is_symlink` are derived from `mode`.
-- Persistence and orchestration are intentionally external to the library.
-- SSH keys are preferred over passwords for production deployments.
-- Unknown SSH host keys are rejected by default unless explicitly allowed.
+- Results are always sorted by `(mtime, path)` — stable and deterministic across runs.
+- When an anchor is set, only entries with `(mtime, path) > (anchor_mtime, anchor_path)` are returned.
+- `file_glob` uses fnmatch syntax and is applied to entry names, not full paths.
+- Persistence, scheduling, and orchestration are intentionally out of scope for this library.
+- SSH key authentication is recommended over passwords for production deployments.
